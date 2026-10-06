@@ -1,0 +1,2 @@
+"""ProjectLens MCP server package."""
+

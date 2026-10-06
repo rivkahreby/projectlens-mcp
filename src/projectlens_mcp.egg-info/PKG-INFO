@@ -1,0 +1,284 @@
+Metadata-Version: 2.4
+Name: projectlens-mcp
+Version: 0.1.0
+Summary: An AI-agnostic MCP server for safely exploring local software projects.
+Requires-Python: >=3.11
+Description-Content-Type: text/markdown
+Requires-Dist: fastmcp<3.0,>=2.0
+Provides-Extra: dev
+Requires-Dist: pytest>=8.0; extra == "dev"
+
+# ProjectLens MCP
+
+ProjectLens MCP is an AI-agnostic [Model Context Protocol (MCP)](https://modelcontextprotocol.io/)
+server that gives MCP-compatible AI clients a bounded set of tools for
+understanding a local software project. The MCP host starts the server and
+decides when to call its tools; ProjectLens does not connect to an AI service
+or generate answers with a model.
+
+> **Project status:** early development. Filesystem inspection, project
+> analysis, and README-context tools are implemented. See
+> [limitations](#current-limitations) before using it with sensitive or
+> untrusted projects.
+
+## The problem it solves
+
+When an AI client is asked to explain an unfamiliar repository, useful context
+is spread across directory layouts, source files, manifests, and configuration.
+Sharing that context manually is tedious, while unrestricted filesystem access
+is unnecessary and risky.
+
+ProjectLens gives the client specific inspection tools instead of broad shell
+or filesystem access. The server is configured with one project root, applies
+bounds and exclusions, and returns structured results for the client to use.
+
+## Architecture
+
+```mermaid
+flowchart LR
+    Client["MCP-compatible client / host"] <-->|"MCP over stdio"| Server["ProjectLens FastMCP server"]
+    Server --> Boundary["Configured root and path checks"]
+    Boundary --> Tools["Project inspection tools"]
+    Tools --> Tree["Structure and search"]
+    Tools --> Analysis["Static manifest analysis"]
+    Tools --> Readme["README context collection"]
+    Tree --> FS[("Local project files")]
+    Analysis --> FS
+    Readme --> FS
+```
+
+The server exposes tools over MCP stdio. `PROJECTLENS_ROOT` is read and
+validated once at startup; tool callers cannot select another directory.
+Business logic lives in Python modules separate from the FastMCP registration
+in `src/projectlens/server.py`. Inspection is static: ProjectLens does not run
+project code or shell commands.
+
+## Features and tools
+
+| Tool | What it returns | Main arguments and limits |
+| --- | --- | --- |
+| `ping` | A connectivity response. | None. |
+| `project_structure` | A readable tree of the configured project. | `max_depth` defaults to `3` (maximum `10`); `max_entries` defaults to `500` (maximum `1,000`). |
+| `search_files` | Matching project-relative filenames. The query is a case-insensitive substring of the filename. | Required `query`; optional `extension`, `path_contains`; `max_depth` defaults to `10` (maximum `20`); `max_results` defaults to `100` (maximum `500`). |
+| `search_code` | Matching project-relative paths, line numbers, and short snippets. The query is literal text. | Same search filters and limits as `search_files`; `case_sensitive` defaults to `false`. |
+| `analyze_project` | Likely languages, recognized frameworks and package managers, dependency names, configuration files, entry points, and basic file statistics. | `max_depth` defaults to `10` (maximum `20`). |
+| `generate_readme_context` | Structured metadata, a bounded tree, and evidence grouped into suggested README sections. | `max_depth` defaults to `4` (maximum `10`); `max_entries` defaults to `200` (maximum `500`). |
+
+Search results include a `truncated` flag when search, traversal, or byte limits
+prevent a complete scan. Analysis and README-context responses also indicate
+which lists or scans were truncated.
+
+### What the analyzer recognizes
+
+Language detection is based on file extensions. Dependency and package-manager
+detection reads a bounded set of recognized manifests, including Python
+`pyproject.toml`, `requirements.txt`, and `Pipfile`; npm `package.json`; Cargo
+`Cargo.toml`; Go `go.mod`; and Maven `pom.xml`. Framework recognition uses a
+small list of known dependency names. These are indicators, not proof that a
+framework is active or that an installation will succeed.
+
+`generate_readme_context` only collects information. It does **not** write a
+README, invent project features, or call an external AI API. The connected
+client can use the evidence to draft text and should verify inferred details.
+
+## Security model
+
+- **One configured root:** `PROJECTLENS_ROOT` must name an existing absolute
+  directory. Requests cannot change it.
+- **Path containment:** paths are resolved and checked against the canonical
+  root. Paths that resolve outside the root are rejected.
+- **No link traversal in scans:** symbolic links are skipped by directory
+  scans. Common generated directories such as `.git`, `node_modules`,
+  `__pycache__`, `.venv`, and `venv` are excluded.
+- **Sensitive-path exclusions:** environment files, common private-key
+  filenames and extensions, credential-store names, and common cloud
+  credential directories (including `.aws`, `.kube`, and `.ssh`) are excluded
+  from scans.
+- **Bounded reads and responses:** code search reads at most 1 MiB per file
+  and 16 MiB per call. Recognized manifests are limited to 1 MiB each and 32
+  per analysis. Traversal is capped at 10,000 directory entries. Tool results
+  also have individual depth, path, dependency, or entry limits.
+- **Snippet redaction:** search snippets redact common credential assignments
+  and Basic/Bearer authorization values.
+- **No execution:** project files are inspected as data. Project code is not
+  imported or run, and the server does not invoke arbitrary shell commands.
+- **No AI credentials:** this server does not require credentials for an AI
+  provider because it does not call one.
+
+### Security limitations
+
+Exclusions and redaction are heuristic. They reduce accidental exposure but
+cannot identify every secret or every custom credential filename. Review the
+configured project and results before sharing them with a client. Filesystem
+paths are checked before access, but this version does not use
+race-resistant, descriptor-relative filesystem operations; a concurrent local
+process that changes links or files during a scan may create a time-of-check /
+time-of-use race. Use it only with project roots you trust and control.
+
+## Requirements and installation
+
+- Python 3.11 or newer
+- `pip`
+- An MCP-compatible client/host to use the MCP tools
+
+From the project checkout, create an isolated environment and install the
+package with its development test dependency:
+
+### Windows PowerShell
+
+```powershell
+py -3.12 -m venv .venv
+.\.venv\Scripts\Activate.ps1
+python -m pip install -e ".[dev]"
+```
+
+If PowerShell does not allow activation, invoke the environment directly:
+
+```powershell
+.\.venv\Scripts\python.exe -m pip install -e ".[dev]"
+```
+
+### macOS / Linux
+
+```sh
+python3 -m venv .venv
+. .venv/bin/activate
+python -m pip install -e ".[dev]"
+```
+
+The runtime dependency is FastMCP. Pytest is installed by the optional `dev`
+dependency group. No database, AI SDK, or external service is required.
+
+## Configuration and running
+
+Set `PROJECTLENS_ROOT` to the **absolute path of the project to inspect**.
+This is the security boundary, not necessarily the ProjectLens installation
+directory.
+
+### Windows PowerShell
+
+```powershell
+$env:PROJECTLENS_ROOT = (Resolve-Path "C:\path\to\project-to-inspect").Path
+projectlens-mcp
+```
+
+### macOS / Linux
+
+```sh
+export PROJECTLENS_ROOT="/path/to/project-to-inspect"
+projectlens-mcp
+```
+
+The installed command starts the MCP stdio server. When testing manually, it
+waits for an MCP client to communicate over standard input and output; it is
+normally launched and managed by the client rather than used as an interactive
+terminal application. It can also be started from the checkout with
+`python -m projectlens.server` after setting `PROJECTLENS_ROOT`.
+
+The server exits with a clear configuration error if the variable is missing
+or does not resolve to an existing directory.
+
+## Connecting an MCP-compatible client
+
+MCP clients use different configuration-file locations and may vary in
+configuration syntax. Add a server entry to the client’s MCP configuration
+using its documented stdio transport format. For clients that use an
+`mcpServers` JSON object, the entry has this general shape:
+
+```json
+{
+  "mcpServers": {
+    "projectlens": {
+      "command": "C:\\path\\to\\projectlens\\.venv\\Scripts\\projectlens-mcp.exe",
+      "args": [],
+      "env": {
+        "PROJECTLENS_ROOT": "C:\\path\\to\\project-to-inspect"
+      }
+    }
+  }
+}
+```
+
+Replace both paths with absolute paths on your machine. On macOS or Linux, the
+command is typically `/path/to/projectlens/.venv/bin/projectlens-mcp`. Some
+clients discover the installed command through `PATH` and accept
+`"command": "projectlens-mcp"` instead. Use the configuration format and
+restart/reload procedure documented by your chosen client. ProjectLens itself
+does not require client-specific model settings.
+
+## Example prompts
+
+After connecting, ask your MCP-compatible client questions such as:
+
+- “Show me the project structure, focusing on the `src` directory.”
+- “Find files with `config` in their names and list the Python files under
+  `src`.”
+- “Search the code for `create_server` and show the matching paths and line
+  numbers.”
+- “Analyze the languages, frameworks, and package managers used in this
+  project.”
+- “Gather README context for this project. Draft an overview from the returned
+  evidence, and flag any claims I should verify.”
+
+Prompts are examples for the client; the server only performs the tool calls
+requested by that client.
+
+## Testing
+
+Run the complete test suite from the project checkout:
+
+```powershell
+python -m pytest -q
+```
+
+The tests use temporary directories and cover root/path validation, traversal
+and symlink handling, project trees, filename and code search, binary and large
+files, manifest detection, README context, tool registration, and checks that
+project code is not executed.
+
+## Project structure
+
+```text
+projectlens-mcp/
+├── src/
+│   └── projectlens/
+│       ├── analyzers/
+│       │   └── project.py
+│       ├── security/
+│       │   ├── files.py
+│       │   └── paths.py
+│       ├── tools/
+│       │   ├── project_structure.py
+│       │   ├── readme_context.py
+│       │   └── search.py
+│       └── server.py
+├── tests/
+├── README.md
+├── pyproject.toml
+└── .gitignore
+```
+
+## Current limitations
+
+- The server currently supports MCP over stdio; it does not provide an HTTP
+  transport.
+- Language, framework, entry-point, and test detection is heuristic and based
+  on file names, extensions, and a limited set of recognized manifests.
+- Dependency extraction does not resolve versions, optional platform markers,
+  workspace semantics, or transitive dependencies.
+- Unsupported or malformed manifests are skipped; truncated analysis may not
+  include every file or dependency.
+- Secret exclusion/redaction cannot guarantee discovery of arbitrary secrets.
+- Concurrent filesystem changes can race with path validation, as described
+  in the [security limitations](#security-limitations).
+- No `LICENSE` file is currently included; choose and add a license before
+  redistributing the project.
+
+## Future improvements
+
+- Add more manifest formats and improve language/framework evidence.
+- Use race-resistant filesystem access where supported.
+- Add explicit coverage reporting and CI once repository hosting is configured.
+- Add a license and client-specific setup guides as their formats are verified.
+- Consider additional MCP transports only when there is a concrete deployment
+  need.
